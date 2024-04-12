@@ -388,6 +388,13 @@ class MotionDecoder(nn.Module):
 
         return unc + (conditioned - unc) * guidance_weight
 
+    """
+    x_pos: pose feature, unused
+    x: 3d landmark residual, shape [B, F, 204]
+    face: 3d landmark frontalized condition, shape [B, 1, 204]
+    cond_embed: audio condition, shape [B, ?]
+    times: ?
+    """
     def forward(
         self,
         x_pos: Tensor,
@@ -404,29 +411,41 @@ class MotionDecoder(nn.Module):
         lower_face = temp[:, :, :17, :]
         lip = temp[:, :, 48:, :]
 
+        # upper_face: shape [B, F, 31 * 3]
         upper_face = upper_face.view(batch_size, frames, -1)
+        # lower_face: shape [B, F, 17 * 3]
         lower_face = lower_face.view(batch_size, frames, -1)
+        # lip: shape [B, F, 20 * 3]
         lip = lip.view(batch_size, frames, -1)
+        # lower_face_w_lip: shape [B, F, 37 * 3]
         lower_face_w_lip = torch.cat((lower_face, lip), axis=-1)
 
+        # lip: shape [B, F, latent_dim]
         lip = self.input_projection_lip(lower_face_w_lip)
         lip = self.abs_pos_encoding(lip)
+        # upper_face: shape [B, F, latent_dim]
         upper_face = self.input_projection_wo_lip(upper_face)
         upper_face = self.abs_pos_encoding(upper_face)
 
-        x = torch.cat((lip, upper_face), axis=-1)  # [B, 1024, 204]
+        # x: shape [B, F, latent_dim x 2]
+        x = torch.cat((lip, upper_face), axis=-1)
 
         # create music conditional embedding with conditional dropout
+        # dropout is applied at training example level.
         keep_mask = prob_mask_like((batch_size,), 1 - cond_drop_prob, device=device)
         keep_mask_embed = rearrange(keep_mask, "b -> b 1 1")
         keep_mask_hidden = rearrange(keep_mask, "b -> b 1")
 
         # hubert
+        # cond_embed: shape [B, 2F, 1024]
+        # cond_tokens: shape [B, 2F, latent_dim]
         cond_tokens = self.cond_projection(cond_embed)
         # encode tokens
         cond_tokens = self.abs_pos_encoding(cond_tokens)
         cond_tokens = self.cond_encoder(cond_tokens)
+        # null_cond_embed: shape [1, 2F, latent_dim]
         null_cond_embed = self.null_cond_embed.to(cond_tokens.dtype)
+        # for dropout examples, the cond_tokens are drawn from gaussian noise
         cond_tokens = torch.where(keep_mask_embed, cond_tokens, null_cond_embed)
 
         mean_pooled_cond_tokens = cond_tokens.mean(dim=-2)
