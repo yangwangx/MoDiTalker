@@ -99,6 +99,7 @@ class TransformerEncoderLayer(nn.Module):
         return self.dropout2(x)
 
 
+# This corresponds to the `AToM block` in Fig. 3
 class FiLMTransformerDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -238,11 +239,10 @@ class DecoderLayerStack(nn.Module):
             x = layer(x, cond, lip_t, nonlip_t, face_cond)
         return x
 
-
 class MotionDecoder(nn.Module):
     def __init__(
         self,
-        nfeats: int,
+        ldmk_dim: int,
         seq_len: int = 150,  # 5 seconds, 30 fps
         latent_dim: int = 256,
         ff_size: int = 1024,
@@ -256,7 +256,6 @@ class MotionDecoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        output_feats = nfeats
         self.rotary = None
         self.abs_pos_encoding = nn.Identity()
         # if rotary, replace absolute embedding with a rotary embedding instance (absolute becomes an identity)
@@ -297,7 +296,7 @@ class MotionDecoder(nn.Module):
         self.face_null_cond_embed = nn.Parameter(torch.randn(1, seq_len, latent_dim))
 
         self.norm_cond = nn.LayerNorm(latent_dim)
-        self.input_projection = nn.Linear(nfeats, latent_dim)  # 수정완료
+        self.input_projection = nn.Linear(ldmk_dim, latent_dim)  # 수정완료
 
         self.input_projection_lip = nn.Linear(37 * 3, latent_dim)
         self.input_projection_wo_lip = nn.Linear(31 * 3, latent_dim)
@@ -380,7 +379,7 @@ class MotionDecoder(nn.Module):
 
         self.seqTransDecoder = DecoderLayerStack(decoderstack)
 
-        self.final_layer = nn.Linear(latent_dim * 2, output_feats)
+        self.final_layer = nn.Linear(latent_dim * 2, ldmk_dim)
 
     def guided_forward(self, x_pos, x, face, cond_embed, times, guidance_weight):
         unc = self.forward(x_pos, x, face, cond_embed, times, cond_drop_prob=1)
@@ -436,54 +435,56 @@ class MotionDecoder(nn.Module):
         keep_mask_embed = rearrange(keep_mask, "b -> b 1 1")
         keep_mask_hidden = rearrange(keep_mask, "b -> b 1")
 
-        # hubert
+        # Audio Sequence Condition.
+        # audio hubert features, each token represents a single frame.
         # cond_embed: shape [B, 2F, 1024]
         # cond_tokens: shape [B, 2F, latent_dim]
         cond_tokens = self.cond_projection(cond_embed)
-        # encode tokens
         cond_tokens = self.abs_pos_encoding(cond_tokens)
         cond_tokens = self.cond_encoder(cond_tokens)
+        # for dropout examples, the cond_tokens are drawn from gaussian noise
         # null_cond_embed: shape [1, 2F, latent_dim]
         null_cond_embed = self.null_cond_embed.to(cond_tokens.dtype)
-        # for dropout examples, the cond_tokens are drawn from gaussian noise
         cond_tokens = torch.where(keep_mask_embed, cond_tokens, null_cond_embed)
 
+        # `cond_hidden` is `F_Audio` in Fig.3
         mean_pooled_cond_tokens = cond_tokens.mean(dim=-2)
         cond_hidden = self.non_attn_cond_projection(mean_pooled_cond_tokens)
+        null_cond_hidden = self.null_cond_hidden.to(t.dtype)
+        cond_hidden = torch.where(keep_mask_hidden, cond_hidden, null_cond_hidden)
 
-        # create the diffusion timestep embedding, add the extra music projection
-        t_hidden = self.time_mlp(times)
-
-        # project to attention and FiLM conditioning
-        t = self.to_time_cond(t_hidden)
-        t_tokens = self.to_time_tokens(t_hidden)
-        lip_t = t
-        nonlip_t = t
-
-        face_tokens = self.face_projection(face)  # [B, 150, 2048] #init_ldmk
+        # Face Identity Condition.
+        # face: [B, F, 204], frontalized face identity
+        # face_tokens: [B, F, latent_dim]
+        face_tokens = self.face_projection(face)  
         face_tokens = self.abs_pos_encoding(face_tokens)
         face_tokens = self.face_encoder(face_tokens)
-
         face_null_cond_embed = self.face_null_cond_embed.to(cond_tokens.dtype)
         face_tokens = torch.where(keep_mask_embed, face_tokens, face_null_cond_embed)
 
+        # `face_hidden` is `F_Landmark` in Fig.3
         mean_pooled_face_tokens = face_tokens.mean(dim=-2)
         face_hidden = self.non_attn_face_projection(mean_pooled_face_tokens)
 
-        lip_t += face_hidden
-        nonlip_t += face_hidden
+        # create the diffusion timestep embedding, add the extra music projection
+        # project to attention and FiLM conditioning
+        t_hidden = self.time_mlp(times)
+        t = self.to_time_cond(t_hidden)
+        t_tokens = self.to_time_tokens(t_hidden)
+
+
+        # Audio only affects lip movement.
+        lip_t = t + face_hidden + cond_hidden
+        nonlip_t = t + face_hidden
 
         # ---------------------------------------------------- #
-        null_cond_hidden = self.null_cond_hidden.to(t.dtype)
-        cond_hidden = torch.where(keep_mask_hidden, cond_hidden, null_cond_hidden)
-        lip_t += cond_hidden
         c = torch.cat((cond_tokens, t_tokens, face_tokens), dim=-2)
-        memory = self.norm_cond(c)  
+        memory = self.norm_cond(c)
 
         # -------------------------------------------------------- #
-        face_wo_lip_c = torch.cat((t_tokens, face_tokens), dim=-2)  # 오디오 cond제외
-        face_memory = self.norm_cond(face_wo_lip_c)
+        nonlip_c = torch.cat((t_tokens, face_tokens), dim=-2)  # 오디오 cond제외
+        face_memory = self.norm_cond(nonlip_c)
       
-        output = self.seqTransDecoder(x, memory, lip_t, nonlip_t, face_memory)  # , pos_memory=None)
+        output = self.seqTransDecoder(x, memory, lip_t, nonlip_t, nonlip_c)  # , pos_memory=None)
         output = self.final_layer(output)
         return output
