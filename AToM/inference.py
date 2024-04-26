@@ -23,16 +23,16 @@ import argparse
 from data_util.face3d_helper import Face3DHelper
 
 # =========================================
-HORIZON = 156
+HORIZON = 156       # sequence length
 # =========================================
+feature_dim = 1024  # audio
+repr_dim = 204      # identity (frontalized 3d landmarks)
 device = "cuda"
-repr_dim = 204
-feature_dim = 1024
 seed = 2021
 deterministic = True
 
 def prepare_models(args):
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    # Create AToM model
     model = MotionDecoder(
         nfeats=repr_dim,
         seq_len=HORIZON,
@@ -44,12 +44,14 @@ def prepare_models(args):
         cond_feature_dim=feature_dim,
         activation=F.gelu,
     )
-
     print("Model has {} parameters".format(sum(y.numel() for y in model.parameters())))
 
+    # Load checkpoint weight
+    checkpoint = torch.load(args.checkpoint, map_location=device)
     EMA = False
     model.load_state_dict(maybe_wrap(checkpoint["ema_state_dict" if EMA else "model_state_dict"], 1))
 
+    # Create diffusion pipeline
     diffusion = GaussianDiffusion(
         model,
         HORIZON,
@@ -72,10 +74,12 @@ def prepare_models(args):
 
 def save_lm_img(lm3D, out_path, WH=256, flip=True):
     if lm3D.shape[-1] == 3:
+        # shape [..., 3], range [-1, 1]
         lm3d = (lm3D * WH / 2 + WH / 2).astype(int)
         lm2d = lm3d[:, :2]
     else:
         lm2d = lm3D.astype(int)
+    # img: white background, draw landmarks as black dots
     img = np.ones([WH, WH, 3], dtype=np.uint8) * 255
     for i in range(len(lm2d)):
         x, y = lm2d[i]
@@ -83,20 +87,20 @@ def save_lm_img(lm3D, out_path, WH=256, flip=True):
 
     if flip:
         img = cv2.flip(img, 0)
-    else:
-        pass
+
     cv2.imwrite(out_path, img)
 
 
 def maybe_wrap(x, num):
     return x if num == 1 else wrap(x)
 
-cnt = 0
+
 def load_idlist(path):
     with open(path, "r") as f:
         lines = f.readlines()
         id_list = [line.replace("\n", "").replace(".mp4", "").strip() for line in lines]
     return id_list
+
 
 def main(args):
     model, diffusion, face3d_helper = prepare_models(args)
@@ -110,57 +114,58 @@ def main(args):
             STR = it * HORIZON
             END = (it + 1) * HORIZON
 
+            # Load `id_cond`, identity, frontalized face landmarks
             if it == 0:
-                cond_keypoint = np.load(os.path.join(args.data_root, "keypoints/face-centric/unposed/{name}/00000.npy"))
-                # cond_keypoint = np.load(f"../data/inference/init_kpt/{name}.npy")
-                cond_keypoint = torch.from_numpy(cond_keypoint)
-                cond_keypoint = cond_keypoint[:, 0:1, :].to(device)
+                id_cond = np.load(os.path.join(args.data_root, "keypoints/face-centric/unposed/{name}/00000.npy"))
+                # id_cond = np.load(f"../data/inference/init_kpt/{name}.npy")
+                id_cond = torch.from_numpy(id_cond)
+                id_cond = id_cond[:, 0:1, :].to(device)
             else : #TODO
-                cond_keypoint = np.load(f"") 
-            
-            if cond_keypoint.shape[-1] == 3:
-                cond_keypoint = cond_keypoint.unsqueeze(0)
-                cond_keypoint = cond_keypoint.view(1, 1, -1)
-            
-            cond_keypoint = torch.cat([cond_keypoint for _ in range(HORIZON)], dim=1) 
+                id_cond = np.load(f"")             
+            if id_cond.shape[-1] == 3:
+                id_cond = id_cond.unsqueeze(0)
+                id_cond = id_cond.view(1, 1, -1)
+            id_cond = torch.cat([id_cond for _ in range(HORIZON)], dim=1) 
+
+            # Load `audio_cond`, audio features
             hubert_name = args.hubert_path
-            cond = np.load(hubert_name) 
-            cond = torch.from_numpy(cond)
-            cond = cond.unsqueeze(0)  
-            cond = cond[:, STR : (it + 2 * HORIZON), :].to(device) 
-            print(cond.shape)
-            shape = [1, HORIZON, repr_dim]
-            pos = torch.zeros(1, HORIZON, 3, device=device)
-            _ = torch.rand(1, HORIZON, repr_dim, device=device)
+            audio_cond = np.load(hubert_name) 
+            audio_cond = torch.from_numpy(audio_cond)
+            audio_cond = audio_cond.unsqueeze(0)  
+            audio_cond = audio_cond[:, STR : (it + 2 * HORIZON), :].to(device) 
+
+
+            landmark_shape = [1, HORIZON, repr_dim]
+            landmark_noise = torch.rand(1, HORIZON, repr_dim, device=device)
+            pos = torch.zeros(1, HORIZON, 3, device=device)  # why 3?
 
             with torch.no_grad():
+                _epoch = 0
+                _render_out = ""
                 atom_out = diffusion.render_sample(
                     face3d_helper,
-                    shape,
-                    cond_keypoint,
-                    _,
+                    landmark_shape,
+                    id_cond,
+                    landmark_noise,
                     pos,
-                    _,  
-                    cond,
-                    0,
-                    "",
+                    landmark_noise,
+                    audio_cond,
+                    _epoch
+                    _render_out
                     name=name,
                     sound=True,
                 )
 
-            frontalized_npy_save_dir = os.path.join(args.save_dir, "frontalized_npy", f"{name}")
-            os.makedirs(frontalized_npy_save_dir, exist_ok=True)
+            # atom_out is the predicted motion from the id_cond
             atom_out = atom_out[0]
-
-            atom_out = atom_out.view(HORIZON, -1, 3).detach().cpu()
-            cond_keypoint_ldmk = cond_keypoint.view(HORIZON, -1, 3).detach().cpu()
-            atom_out += cond_keypoint_ldmk
-            atom_out = atom_out.view(HORIZON, -1)
-
+            atom_out = atom_out.view(HORIZON, -1).detach().cpu()
+            atom_out += id_cond.view(HORIZON, -1).detach().cpu()
             atom_out = atom_out / 10 + face3d_helper.key_mean_shape.squeeze().reshape([1, -1]).cpu().numpy()
             atom_out = atom_out.view(HORIZON, 68, 3)
             atom_out = atom_out.cpu().numpy()
 
+            frontalized_npy_save_dir = os.path.join(args.save_dir, "frontalized_npy", f"{name}")
+            os.makedirs(frontalized_npy_save_dir, exist_ok=True)
             np.save(f"{frontalized_npy_save_dir}/atom_{str(it)}.npy", atom_out)
             # ------------------------- visualization------------------------------------------ #
             frontalized_png_save_dir = os.path.join(args.save_dir, "frontalized_png", f"{name}")
